@@ -25,7 +25,7 @@ use ccore::{
     StateInfo, UnverifiedTransaction,
 };
 use cdb::AsHashDB;
-use cmerkle::{Trie, TrieFactory};
+use cmerkle::{skewed_merkle_root, Trie, TrieFactory};
 use cnetwork::{Api, EventSender, NetworkExtension, NodeId};
 use cstate::{FindActionHandler, TopStateView};
 use ctimer::TimerToken;
@@ -61,7 +61,7 @@ pub struct TokenInfo {
 enum State {
     SnapshotHeader(BlockHash, u64),
     SnapshotBody {
-        block: BlockHash,
+        header: EncodedHeader,
         prev_root: H256,
     },
     SnapshotTopChunk(H256),
@@ -137,7 +137,7 @@ impl Extension {
             let parent =
                 client.block_header(&parent_hash.into()).expect("Parent header of the snapshot header must exist");
             return State::SnapshotBody {
-                block: hash,
+                header,
                 prev_root: parent.transactions_root(),
             }
         }
@@ -387,8 +387,29 @@ impl NetworkExtension<Event> for Extension {
                         }
                     }
                     State::SnapshotBody {
+                        ref header,
                         ..
-                    } => unimplemented!(),
+                    } => {
+                        for id in &peer_ids {
+                            if let Some(requests) = self.requests.get_mut(id) {
+                                ctrace!(SYNC, "Send snapshot body request to {}", id);
+                                let request = RequestMessage::Bodies(vec![header.hash()]);
+                                let request_id = self.last_request;
+                                self.last_request += 1;
+                                requests.push((request_id, request.clone()));
+                                self.api.send(id, Arc::new(Message::Request(request_id, request).rlp_bytes()));
+
+                                let token = &self.tokens[id];
+                                let token_info = self.tokens_info.get_mut(token).unwrap();
+
+                                let _ = self.api.clear_timer(*token);
+                                self.api
+                                    .set_timer_once(*token, Duration::from_millis(SYNC_EXPIRE_REQUEST_INTERVAL))
+                                    .expect("Timer set succeeds");
+                                token_info.request_id = Some(request_id);
+                            }
+                        }
+                    }
                     State::SnapshotTopChunk(..) => unimplemented!(),
                     State::SnapshotShardChunk(..) => unimplemented!(),
                     State::Full => {
@@ -801,20 +822,11 @@ impl Extension {
         match self.state {
             State::SnapshotHeader(hash, _) => match headers {
                 [parent, header] if header.hash() == hash => {
-                    match self.client.import_bootstrap_header(&header) {
-                        Ok(_) | Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
-                            self.state = State::SnapshotBody {
-                                block: hash,
-                                prev_root: *parent.transactions_root(),
-                            };
-                            cdebug!(SYNC, "Transitioning state to {:?}", self.state);
-                        }
-                        Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
-                        // FIXME: handle import errors
-                        Err(err) => {
-                            cwarn!(SYNC, "Cannot import header({}): {:?}", header.hash(), err);
-                        }
-                    }
+                    self.state = State::SnapshotBody {
+                        header: EncodedHeader::new(header.rlp_bytes().to_vec()),
+                        prev_root: *parent.transactions_root(),
+                    };
+                    cdebug!(SYNC, "Transitioning state to {:?}", self.state);
                 }
                 _ => cdebug!(
                     SYNC,
@@ -874,51 +886,80 @@ impl Extension {
 
     fn on_body_response(&mut self, hashes: Vec<BlockHash>, bodies: Vec<Vec<UnverifiedTransaction>>) {
         ctrace!(SYNC, "Received body response with lenth({}) {:?}", hashes.len(), hashes);
-        {
-            self.body_downloader.import_bodies(hashes, bodies);
-            let completed = self.body_downloader.drain();
-            for (hash, transactions) in completed {
-                let header = self
-                    .client
-                    .block_header(&BlockId::Hash(hash))
-                    .expect("Downloaded body's header must exist")
-                    .decode();
-                let block = Block {
-                    header,
-                    transactions,
-                };
-                cdebug!(SYNC, "Body download completed for #{}({})", block.header.number(), hash);
-                match self.client.import_block(block.rlp_bytes(&Seal::With)) {
-                    Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
-                        cwarn!(SYNC, "Downloaded already existing block({})", hash)
-                    }
-                    Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {
-                        cwarn!(SYNC, "Downloaded already queued in the verification queue({})", hash)
-                    }
-                    Err(err) => {
+
+        match self.state {
+            State::SnapshotBody {
+                ref header,
+                prev_root,
+            } => {
+                let body = bodies.first().expect("Body response in SnapshotBody state has only one body");
+                let new_root = skewed_merkle_root(prev_root, body.iter().map(Encodable::rlp_bytes));
+                if header.transactions_root() == new_root {
+                    let block = Block {
+                        header: header.decode(),
+                        transactions: body.clone(),
+                    };
+                    match self.client.import_bootstrap_block(&block) {
+                        Ok(_) | Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
+                            self.state = State::SnapshotTopChunk(header.state_root());
+                            cdebug!(SYNC, "Transitioning state to {:?}", self.state);
+                        }
+                        Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
                         // FIXME: handle import errors
-                        cwarn!(SYNC, "Cannot import block({}): {:?}", hash, err);
-                        break
+                        Err(err) => {
+                            cwarn!(SYNC, "Cannot import header({}): {:?}", header.hash(), err);
+                        }
                     }
-                    _ => {}
                 }
             }
-        }
+            State::Full => {
+                {
+                    self.body_downloader.import_bodies(hashes, bodies);
+                    let completed = self.body_downloader.drain();
+                    for (hash, transactions) in completed {
+                        let header = self
+                            .client
+                            .block_header(&BlockId::Hash(hash))
+                            .expect("Downloaded body's header must exist")
+                            .decode();
+                        let block = Block {
+                            header,
+                            transactions,
+                        };
+                        cdebug!(SYNC, "Body download completed for #{}({})", block.header.number(), hash);
+                        match self.client.import_block(block.rlp_bytes(&Seal::With)) {
+                            Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
+                                cwarn!(SYNC, "Downloaded already existing block({})", hash)
+                            }
+                            Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {
+                                cwarn!(SYNC, "Downloaded already queued in the verification queue({})", hash)
+                            }
+                            Err(err) => {
+                                // FIXME: handle import errors
+                                cwarn!(SYNC, "Cannot import block({}): {:?}", hash, err);
+                                break
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let total_score = self.client.chain_info().best_proposal_score;
+                let mut peer_ids: Vec<_> = self.header_downloaders.keys().cloned().collect();
+                peer_ids.shuffle(&mut thread_rng());
 
-        let total_score = self.client.chain_info().best_proposal_score;
-        let mut peer_ids: Vec<_> = self.header_downloaders.keys().cloned().collect();
-        peer_ids.shuffle(&mut thread_rng());
+                for id in peer_ids {
+                    let peer_score = if let Some(peer) = self.header_downloaders.get(&id) {
+                        peer.total_score()
+                    } else {
+                        U256::zero()
+                    };
 
-        for id in peer_ids {
-            let peer_score = if let Some(peer) = self.header_downloaders.get(&id) {
-                peer.total_score()
-            } else {
-                U256::zero()
-            };
-
-            if peer_score > total_score {
-                self.send_body_request(&id);
+                    if peer_score > total_score {
+                        self.send_body_request(&id);
+                    }
+                }
             }
+            _ => {}
         }
     }
 }
