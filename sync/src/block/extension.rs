@@ -60,7 +60,10 @@ pub struct TokenInfo {
 #[derive(Debug)]
 enum State {
     SnapshotHeader(BlockHash, u64),
-    SnapshotBody(BlockHash),
+    SnapshotBody {
+        block: BlockHash,
+        prev_root: H256,
+    },
     SnapshotTopChunk(H256),
     SnapshotShardChunk(ShardId, H256),
     Full,
@@ -130,7 +133,13 @@ impl Extension {
             _ => return State::SnapshotHeader(hash, num),
         };
         if client.block_body(&hash.into()).is_none() {
-            return State::SnapshotBody(hash)
+            let parent_hash = header.parent_hash();
+            let parent =
+                client.block_header(&parent_hash.into()).expect("Parent header of the snapshot header must exist");
+            return State::SnapshotBody {
+                block: hash,
+                prev_root: parent.transactions_root(),
+            }
         }
 
         let state_db = client.state_db().read();
@@ -372,12 +381,14 @@ impl NetworkExtension<Event> for Extension {
                     State::SnapshotHeader(_, num) => {
                         for id in &peer_ids {
                             self.send_header_request(id, RequestMessage::Headers {
-                                start_number: num,
-                                max_count: 1,
+                                start_number: num - 1,
+                                max_count: 2,
                             });
                         }
                     }
-                    State::SnapshotBody(..) => unimplemented!(),
+                    State::SnapshotBody {
+                        ..
+                    } => unimplemented!(),
                     State::SnapshotTopChunk(..) => unimplemented!(),
                     State::SnapshotShardChunk(..) => unimplemented!(),
                     State::Full => {
@@ -489,7 +500,9 @@ impl Extension {
                     None
                 }
             }
-            State::SnapshotBody(..) => unimplemented!(),
+            State::SnapshotBody {
+                ..
+            } => unimplemented!(),
             State::SnapshotTopChunk(..) => unimplemented!(),
             State::SnapshotShardChunk(..) => unimplemented!(),
             State::Full => {
@@ -537,7 +550,9 @@ impl Extension {
                     None
                 }
             }
-            State::SnapshotBody(..) => None,
+            State::SnapshotBody {
+                ..
+            } => None,
             State::SnapshotTopChunk(..) => None,
             State::SnapshotShardChunk(..) => None,
             State::Full => {
@@ -785,15 +800,20 @@ impl Extension {
         ctrace!(SYNC, "Received header response from({}) with length({})", from, headers.len());
         match self.state {
             State::SnapshotHeader(hash, _) => match headers {
-                [header] if header.hash() == hash => {
+                [parent, header] if header.hash() == hash => {
                     match self.client.import_bootstrap_header(&header) {
-                        Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {}
+                        Ok(_) | Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
+                            self.state = State::SnapshotBody {
+                                block: hash,
+                                prev_root: *parent.transactions_root(),
+                            };
+                            cdebug!(SYNC, "Transitioning state to {:?}", self.state);
+                        }
                         Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
                         // FIXME: handle import errors
                         Err(err) => {
                             cwarn!(SYNC, "Cannot import header({}): {:?}", header.hash(), err);
                         }
-                        _ => {}
                     }
                 }
                 _ => cdebug!(
@@ -804,7 +824,9 @@ impl Extension {
                     headers.len()
                 ),
             },
-            State::SnapshotBody(..) => {}
+            State::SnapshotBody {
+                ..
+            } => {}
             State::SnapshotTopChunk(..) => {}
             State::SnapshotShardChunk(..) => {}
             State::Full => {
