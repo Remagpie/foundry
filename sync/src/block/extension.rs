@@ -488,6 +488,7 @@ impl NetworkExtension<Event> for Extension {
                         if let Some(root) = restore.next_to_feed() {
                             self.send_chunk_request(&block, &root);
                         } else {
+                            self.client.force_update_best_block(&block);
                             self.transition_to_full();
                         }
                     }
@@ -858,6 +859,24 @@ impl Extension {
         match self.state {
             State::SnapshotHeader(hash, _) => match headers {
                 [parent, header] if header.hash() == hash => {
+                    match self.client.import_trusted_header(parent) {
+                        Ok(_)
+                        | Err(BlockImportError::Import(ImportError::AlreadyInChain))
+                        | Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
+                        Err(err) => {
+                            cwarn!(SYNC, "Cannot import header({}): {:?}", parent.hash(), err);
+                            return
+                        }
+                    }
+                    match self.client.import_trusted_header(header) {
+                        Ok(_)
+                        | Err(BlockImportError::Import(ImportError::AlreadyInChain))
+                        | Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
+                        Err(err) => {
+                            cwarn!(SYNC, "Cannot import header({}): {:?}", header.hash(), err);
+                            return
+                        }
+                    }
                     self.state = State::SnapshotBody {
                         header: EncodedHeader::new(header.rlp_bytes().to_vec()),
                         prev_root: *parent.transactions_root(),
@@ -935,7 +954,7 @@ impl Extension {
                         header: header.decode(),
                         transactions: body.clone(),
                     };
-                    match self.client.import_bootstrap_block(&block) {
+                    match self.client.import_trusted_block(&block) {
                         Ok(_) | Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
                             self.state = State::SnapshotTopChunk {
                                 block: header.hash(),
@@ -946,7 +965,7 @@ impl Extension {
                         Err(BlockImportError::Import(ImportError::AlreadyQueued)) => {}
                         // FIXME: handle import errors
                         Err(err) => {
-                            cwarn!(SYNC, "Cannot import header({}): {:?}", header.hash(), err);
+                            cwarn!(SYNC, "Cannot import block({}): {:?}", header.hash(), err);
                         }
                     }
                 }
@@ -1045,6 +1064,7 @@ impl Extension {
             if let Some(root) = restore.next_to_feed() {
                 self.send_chunk_request(&block, &root);
             } else {
+                self.client.force_update_best_block(&block);
                 self.transition_to_full();
             }
         }
