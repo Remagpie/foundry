@@ -17,6 +17,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::mem::discriminant;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,6 +196,10 @@ impl Extension {
     }
 
     fn send_status(&mut self, id: &NodeId) {
+        if discriminant(&self.state) != discriminant(&State::Full) {
+            return
+        }
+
         let chain_info = self.client.chain_info();
         self.api.send(
             id,
@@ -211,6 +216,10 @@ impl Extension {
     }
 
     fn send_status_broadcast(&mut self) {
+        if discriminant(&self.state) != discriminant(&State::Full) {
+            return
+        }
+
         let chain_info = self.client.chain_info();
         for id in self.connected_nodes.iter() {
             self.api.send(
@@ -1077,6 +1086,7 @@ impl Extension {
             downloader.update_pivot(best_hash);
         }
         self.state = State::Full;
+        self.send_status_broadcast();
     }
 }
 
